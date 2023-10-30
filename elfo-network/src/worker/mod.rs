@@ -125,6 +125,7 @@ impl Worker {
             tx: local_tx.clone(),
             tx_flows: tx_flows.clone(),
         };
+
         let remote_group_guard = self.topology.register_remote(
             self.local.group_no,
             (self.remote.node_no, self.remote.group_no),

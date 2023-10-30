@@ -333,6 +333,17 @@ cfg_network!({
             let object = Object::new(handle_addr, Box::new(handle) as Box<dyn RemoteHandle>);
             entry.insert(object);
 
+            // XXX: register the network actor to handle requests that have not been routed
+            // anywhere.
+            self.book.register_remote(
+                crate::scope::expose()
+                    .group()
+                    .group_no()
+                    .expect("invalid group no"),
+                remote_group,
+                handle_addr,
+            );
+
             self.book
                 .register_remote(local_group, remote_group, handle_addr);
 
@@ -470,6 +481,7 @@ cfg_network!({
     // Nothing for now, reserved for future use.
     pub struct NodeDiscovery(());
 
+    // TODO: should undo register_remote in drop
     #[stability::unstable]
     pub struct RegisterRemoteGroupGuard<'a> {
         book: &'a AddressBook,
