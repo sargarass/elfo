@@ -1,28 +1,40 @@
-use elfo::prelude::*;
+use elfo::{
+    prelude::*,
+    routers::{MapRouter, Outcome, Singleton},
+};
+
 use tracing::{info, warn};
 
 use crate::protocol::{AskName, Hello};
 
 fn consumer() -> Blueprint {
-    ActorGroup::new().exec(|mut ctx| async move {
-        while let Some(envelope) = ctx.recv().await {
-            let sender = envelope.sender();
+    ActorGroup::new()
+        .router(MapRouter::new(|e| {
+            msg!(match e {
+                Hello => Outcome::GentleUnicast(Singleton),
+                AskName => Outcome::GentleUnicast(Singleton),
+                _ => Outcome::Discard,
+            })
+        }))
+        .exec(|mut ctx| async move {
+            while let Some(envelope) = ctx.recv().await {
+                let sender = envelope.sender();
 
-            msg!(match envelope {
-                Hello(i) => {
-                    info!("received Hello({})", i);
+                msg!(match envelope {
+                    Hello(i) => {
+                        info!("received Hello({})", i);
 
-                    if let Err(err) = ctx.send_to(sender, Hello(i)).await {
-                        warn!("cannot say Hello({}) back: {}", i, err);
+                        if let Err(err) = ctx.send_to(sender, Hello(i)).await {
+                            warn!("cannot say Hello({}) back: {}", i, err);
+                        }
                     }
-                }
-                (AskName, token) => {
-                    info!("asked for name");
-                    ctx.respond(token, "Bob".into());
-                }
-            });
-        }
-    })
+                    msg => {
+                        info!("asked for name");
+                        drop(msg);
+                    }
+                });
+            }
+        })
 }
 
 pub(crate) fn topology() -> elfo::Topology {

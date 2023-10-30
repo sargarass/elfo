@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use sharded_slab::{self as slab, Slab};
+use tracing::info;
 
 use crate::{
     addr::{Addr, GroupNo, NodeLaunchId, NodeNo, SlabConfig},
@@ -45,7 +46,6 @@ impl AddressBook {
 
     pub fn get(&self, addr: Addr) -> Option<ObjectRef<'_>> {
         let addr = self.prepare_addr(addr)?;
-
         self.local
             .get(addr.slot_key(self.launch_id))
             // sharded-slab doesn't check top bits, so we need to check them manually.
@@ -90,7 +90,8 @@ impl AddressBook {
         // If the address is remote, replace it with a remote handler's address.
         #[cfg(feature = "network")]
         if addr.is_remote() {
-            return self.remote.get(addr);
+            let res = self.remote.get(addr);
+            return res;
         }
 
         Some(addr)
@@ -133,9 +134,16 @@ cfg_network!({
             let key = u64::from(local_group.into_bits()) << 32
                 | u64::from(remote_group.0.into_bits()) << 8
                 | u64::from(remote_group.1.into_bits());
-
+            info!(
+                "register {} {} {} = key {}",
+                u64::from(local_group.into_bits()),
+                u64::from(remote_group.0.into_bits()),
+                u64::from(remote_group.1.into_bits()),
+                key
+            );
             self.map.rcu(|map| {
                 let mut map = (**map).clone();
+                info!("register {} {}", key, handle_addr);
                 map.insert(key, handle_addr);
                 map
             });
@@ -147,7 +155,13 @@ cfg_network!({
             let local = crate::scope::with(|scope| scope.group()).node_no_group_no();
             let remote = remote_addr.node_no_group_no();
             let key = u64::from(local) << 32 | u64::from(remote);
-
+            info!(
+                "{} {} get {} remote_addr {}",
+                u64::from(local),
+                u64::from(remote),
+                key,
+                remote_addr
+            );
             self.map.load().get(&key).copied()
         }
     }

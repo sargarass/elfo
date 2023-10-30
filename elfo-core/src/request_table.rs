@@ -4,6 +4,7 @@ use futures_intrusive::sync::ManualResetEvent;
 use parking_lot::Mutex;
 use slotmap::{new_key_type, Key, SlotMap};
 use smallvec::SmallVec;
+use tracing::info;
 
 use crate::{
     address_book::AddressBook, envelope::Envelope, errors::RequestError, message::AnyMessage,
@@ -309,8 +310,15 @@ impl<T> Drop for ResponseToken<T> {
     #[inline]
     fn drop(&mut self) {
         // Do nothing for forgotten tokens.
+        info!("RESPOND is_some {}!", self.data.is_some());
+
         let data = ward!(self.data.take());
         let book = data.book.clone();
+        info!(
+            "RESPOND 1! {} {}",
+            data.sender,
+            book.get(data.sender).is_some()
+        );
         let object = ward!(book.get(data.sender));
         let this = ResponseToken {
             data: Some(data),
@@ -322,7 +330,7 @@ impl<T> Drop for ResponseToken<T> {
         } else {
             RequestError::Failed
         };
-
+        info!("RESPOND!");
         object.respond(this, Err(err));
     }
 }
