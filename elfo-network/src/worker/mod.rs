@@ -125,7 +125,9 @@ impl Worker {
             tx: local_tx.clone(),
             tx_flows: tx_flows.clone(),
         };
+
         let remote_group_guard = self.topology.register_remote(
+            self.ctx.addr(),
             self.local.group_no,
             (self.remote.node_no, self.remote.group_no),
             &self.remote.group_name,
@@ -606,21 +608,27 @@ impl SocketReader {
             this: &'a SocketReader,
             flows: &'a mut RxFlows,
         }
+        info!("handle_routed_message {:?}", &envelope);
 
         impl GroupVisitor for TrySendGroupVisitor<'_> {
-            fn done(&mut self) {}
+            fn done(&mut self) {
+                info!("done");
+            }
 
             fn empty(&mut self, _envelope: Envelope) {
+                info!("empty {:?}", _envelope);
                 // TODO: maybe emit some metric?
             }
 
             fn visit(&mut self, object: &ObjectArc, envelope: &Envelope) {
+                info!("visit {:?}", &envelope);
                 let envelope = envelope.duplicate();
                 self.this
                     .do_handle_message(self.flows, object, envelope, true);
             }
 
             fn visit_last(&mut self, object: &ObjectArc, envelope: Envelope) {
+                info!("visit_last {:?}", &envelope);
                 self.this
                     .do_handle_message(self.flows, object, envelope, true);
             }
@@ -862,6 +870,7 @@ impl remote::RemoteHandle for RemoteHandle {
         debug_assert!(!token.is_forgotten());
         debug_assert!(token.sender().is_remote());
 
+        info!("respond token is_last={}", token.is_last());
         let recipient = NetworkAddr::from_remote(token.sender());
 
         if likely(self.tx_flows.do_acquire(recipient)) {
