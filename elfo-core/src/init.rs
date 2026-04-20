@@ -197,7 +197,7 @@ pub async fn do_start<F: Future>(
 
     let scope = Scope::new(TraceId::generate(), addr, meta, Arc::new(scope_shared));
     scope.clone().sync_within(|| actor.on_start()); // need to emit initial metrics
-    entry.insert(Object::new(addr, actor));
+    entry.insert(Object::new(addr, Box::new(actor)));
 
     // It must be called after `entry.insert()`.
     let ctx = ctx

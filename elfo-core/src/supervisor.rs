@@ -1,10 +1,13 @@
 use std::{future::Future, mem, ops::Deref, sync::Arc, time::Duration};
 
-use dashmap::DashMap;
+use dashmap::{
+    DashMap,
+    Entry::{Occupied, Vacant},
+};
 use futures::future::BoxFuture;
 use fxhash::FxBuildHasher;
 use metrics::{decrement_gauge, increment_gauge};
-use parking_lot::RwLock;
+use parking_lot::{Condvar, Mutex, RwLock};
 use tracing::{Instrument, Span, debug, error, error_span, info, warn};
 
 use elfo_utils::CachePadded;
@@ -14,7 +17,7 @@ use crate::{
     ResponseToken,
     actor::{Actor, ActorMeta, ActorStartInfo},
     actor_status::ActorStatus,
-    addr::{Addr, NodeLaunchId, NodeNo},
+    addr::{Addr, GroupNo, NodeLaunchId, NodeNo},
     config::{AnyConfig, Config, SystemConfig},
     context::Context,
     envelope::Envelope,
@@ -42,6 +45,7 @@ pub(crate) struct Supervisor<R: Router<C>, C, X> {
     span: Span,
     context: Context,
     objects: DashMap<R::Key, OwnedObject, FxBuildHasher>,
+    pending_remote_spawns: DashMap<R::Key, Arc<PendingRemoteSpawn>>,
     router: R,
     exec: X,
     control: CachePadded<RwLock<Control<C>>>,
@@ -57,18 +61,32 @@ struct Control<C> {
     stop_spawning: bool,
 }
 
+enum SpawnResult {
+    Spawned(OwnedObject),
+    SpawnStopped,
+    WaitRemoteSpawn(Arc<PendingRemoteSpawn>),
+}
+
 /// Returns `None` if cannot be spawned.
 macro_rules! get_or_spawn {
     ($this:ident, $key:expr, $start_info:expr) => {{
         let key = $key;
         match $this.objects.get(&key) {
             Some(object) => Some(object),
-            None => $this
-                .objects
-                .entry(key.clone())
-                .or_try_insert_with(|| $this.spawn(key, $start_info, Default::default()).ok_or(()))
-                .map(|o| o.downgrade()) // FIXME: take an exclusive lock here.
-                .ok(),
+            None => match $this.objects.entry(key.clone()) {
+                // FIXME(loyd): take an exclusive lock here.
+                Occupied(entry) => Some(entry.into_ref().downgrade()),
+                Vacant(entry) => match $this.spawn(key.clone(), $start_info, Default::default()) {
+                    // FIXME(loyd): take an exclusive lock here.
+                    SpawnResult::Spawned(object) => Some(entry.insert(object).downgrade()),
+                    SpawnResult::SpawnStopped => None,
+                    SpawnResult::WaitRemoteSpawn(pending) => {
+                        drop(entry);
+                        pending.wait_for_slot();
+                        $this.objects.get(&key)
+                    }
+                },
+            },
         }
     }};
 }
@@ -110,6 +128,7 @@ where
             restart_policy,
             termination_policy,
             objects: DashMap::default(),
+            pending_remote_spawns: Default::default(),
             router,
             exec,
             control: CachePadded::new(RwLock::new(control)),
@@ -275,163 +294,116 @@ where
         self: &Arc<Self>,
         key: R::Key,
         start_info: ActorStartInfo,
-        mut backoff: RestartBackoff,
-    ) -> Option<OwnedObject> {
-        let control = self.control.read();
-        if control.stop_spawning {
-            return None;
-        }
-
-        let group_no = self.context.group().group_no().expect("invalid group addr");
-        let entry = self.context.book().vacant_entry(group_no);
-        let addr = entry.addr();
-
+        backoff: RestartBackoff,
+    ) -> SpawnResult {
         let key_str = key.to_string();
-        let span = error_span!(
-            parent: Span::none(),
-            "",
-            actor_group = self.meta.group.as_str(),
-            actor_key = key_str.as_str()
-        );
+        let group_name = self.meta.group.clone();
+        let rt_selection_meta = ActorMeta {
+            group: group_name.clone(),
+            key: key_str.clone(),
+        };
+        let rt = self.rt_manager.get(&rt_selection_meta);
+        drop(rt_selection_meta);
 
-        let system_config = control.system_config.clone();
-
-        let user_config = control
-            .user_config
-            .as_ref()
-            .cloned()
-            .expect("config is unset");
-
-        let ctx = self
-            .context
-            .clone()
-            .with_key(key.clone())
-            .with_config(user_config);
-
-        let meta = Arc::new(ActorMeta {
-            group: self.meta.group.clone(),
-            key: key_str,
-        });
-        let actor = Actor::new(
-            meta.clone(),
-            addr,
-            &system_config.mailbox,
-            self.termination_policy.clone(),
-            self.status_subscription.clone(),
-        );
-
-        drop(control);
-
-        let sv = self.clone();
-
-        // TODO: move to `harness.rs`.
-        let fut = async move {
-            let thread = std::thread::current();
-
-            info!(%addr, thread = %thread.name().unwrap_or("?"), "started");
-
-            sv.objects
-                .get(&key)
-                .expect("where is the current actor?")
-                .as_actor()
-                .expect("a supervisor stores only actors")
-                .on_start();
-
-            // It must be called after `entry.insert()`.
-            let ctx = ctx.with_addr(addr).with_start_info(start_info);
-            let fut = async { sv.exec.exec(ctx).await.unify() };
-            let new_status = match panic::catch(fut).await {
-                Ok(Ok(())) => ActorStatus::TERMINATED,
-                Ok(Err(err)) => ActorStatus::FAILED.with_details(ErrorChain(&*err)),
-                Err(panic) => ActorStatus::FAILED.with_details(panic),
-            };
-
-            let restart_after = {
-                let object = sv.objects.get(&key).expect("where is the current actor?");
-
-                let actor = object.as_actor().expect("a supervisor stores only actors");
-
-                // Select the restart policy with the following priority: actor override >
-                // config override > blueprint restart policy..
-                let default_restart_policy = sv
-                    .control
-                    .read()
-                    .system_config
-                    .restart_policy
-                    .make_policy()
-                    .unwrap_or(sv.restart_policy.clone());
-                let restart_policy = actor.restart_policy().unwrap_or(default_restart_policy);
-
-                let restarting_allowed = restart_policy.restarting_allowed(&new_status)
-                    && !sv.control.read().stop_spawning;
-
-                actor.set_status(new_status);
-
-                restarting_allowed
-                    .then(|| {
-                        restart_policy
-                            .restart_params()
-                            .and_then(|p| backoff.next(&p))
-                    })
-                    .flatten()
-            };
-
-            let _ = if let Some(after) = restart_after {
-                if after == Duration::ZERO {
-                    debug!("actor will be restarted immediately");
-                } else {
-                    debug!(?after, "actor will be restarted");
-
-                    increment_gauge!("elfo_restarting_actors", 1.);
-                    tokio::time::sleep(after).await;
-                    decrement_gauge!("elfo_restarting_actors", 1.);
-                }
-
-                // Restarted actors should have a new trace id.
-                scope::set_trace_id(TraceId::generate());
-
-                backoff.start();
-                if let Some(object) = sv.spawn(key.clone(), ActorStartInfo::on_restart(), backoff) {
-                    sv.objects.insert(key.clone(), object)
-                } else {
-                    sv.objects.remove(&key).map(|(_, v)| v)
-                }
-            } else {
-                debug!("actor won't be restarted");
-                sv.objects.remove(&key).map(|(_, v)| v)
+        let notify_waiters_by_key = |key| {
+            if let Some((_, pending)) = self.pending_remote_spawns.remove(key) {
+                let mut in_flight = pending.in_flight.lock();
+                *in_flight = false;
+                pending.cv.notify_all();
             }
-            .expect("where is the current actor?");
-
-            // TODO: should we unregister the address right after failure?
-            sv.context.book().remove(addr);
         };
 
-        // tokio-console complains about futures larger than 1KiB even if tokio boxes
-        // such futures by itself, so we reduce noise in the console this way =(
-        #[cfg(all(tokio_unstable, feature = "tokio-tracing"))]
-        let fut = Box::pin(fut);
+        let on_target = tokio::runtime::Handle::try_current()
+            .ok()
+            .map(|cur| cur.id() == rt.id())
+            .unwrap_or(false);
 
-        let rt = self.rt_manager.get(&meta);
+        if on_target {
+            let control = self.control.read();
+            if control.stop_spawning {
+                notify_waiters_by_key(&key);
+                return SpawnResult::SpawnStopped;
+            }
 
-        entry.insert(Object::new(addr, actor));
+            let group_no = self.context.group().group_no().expect("invalid group addr");
+            let system_config = control.system_config.clone();
 
-        let group_scope = self.scope_shared.clone();
-        let scope = Scope::new(scope::trace_id(), addr, meta.clone(), group_scope)
-            .with_telemetry(&system_config.telemetry);
+            let user_config = control
+                .user_config
+                .as_ref()
+                .cloned()
+                .expect("config is unset");
 
-        #[cfg(feature = "unstable-stuck-detection")]
-        let fut = MeasurePoll::new(fut.instrument(span), self.rt_manager.stuck_detector());
-        #[cfg(not(feature = "unstable-stuck-detection"))]
-        let fut = MeasurePoll::new(fut.instrument(span));
+            drop(control);
 
-        // Finally, start the actor's task.
-        crate::task::Builder::new(scope)
-            .spawn_on(fut, &rt)
-            .expect("spawn an actor's task");
+            let sv = self.clone();
+            let termination_policy = self.termination_policy.clone();
+            let status_sub = self.status_subscription.clone();
+            let ctx = self
+                .context
+                .clone()
+                .with_key(key.clone())
+                .with_config(user_config);
 
-        // Register the actor in the book to make it reachable.
-        let object = self.context.book().get_owned(addr).expect("just created");
-        Some(object)
+            let actor = run_spawn(
+                sv,
+                ctx,
+                key.clone(),
+                start_info,
+                backoff,
+                group_no,
+                group_name,
+                key_str,
+                system_config,
+                termination_policy,
+                status_sub,
+            );
+            let res = match actor {
+                Some(actor) => SpawnResult::Spawned(actor),
+                None => SpawnResult::SpawnStopped,
+            };
+            notify_waiters_by_key(&key);
+            res
+        } else {
+            let pending = self
+                .pending_remote_spawns
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(PendingRemoteSpawn::default()))
+                .clone();
+
+            if *pending.in_flight.lock() {
+                return SpawnResult::WaitRemoteSpawn(pending);
+            }
+
+            let guard = InFlightGuard::arm(pending.clone());
+
+            // We want this code to run on the tokio's worker thread to get all allocations
+            // locally
+            rt.spawn({
+                let sv = self.clone();
+                let scope = scope::expose();
+                let f = move || {
+                    let _guard = guard;
+                    let Vacant(entry) = sv.objects.entry(key.clone()) else {
+                        // Another on-target caller already spawned this actor
+                        return;
+                    };
+
+                    let object = match sv.spawn(key.clone(), start_info, backoff) {
+                        SpawnResult::Spawned(object) => object,
+                        SpawnResult::SpawnStopped => return,
+                        SpawnResult::WaitRemoteSpawn(_) => {
+                            unreachable!("worker is already on remote rt!")
+                        }
+                    };
+                    entry.insert(object);
+                };
+
+                async move { scope.sync_within(f) }
+            });
+
+            SpawnResult::WaitRemoteSpawn(pending)
+        }
     }
 
     fn spawn_on_group_mounted(self: &Arc<Self>, outcome: Outcome<R::Key>) {
@@ -528,6 +500,221 @@ where
         };
 
         Box::pin(fut)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_spawn<R, C, X>(
+    sv: Arc<Supervisor<R, C, X>>,
+    ctx: Context<C, R::Key>,
+    key: R::Key,
+    start_info: ActorStartInfo,
+    backoff: RestartBackoff,
+    group_no: GroupNo,
+    group_name: String,
+    key_str: String,
+    system_config: Arc<SystemConfig>,
+    termination_policy: TerminationPolicy,
+    status_sub: Arc<SubscriptionManager>,
+) -> Option<OwnedObject>
+where
+    R: Router<C>,
+    X: Exec<Context<C, R::Key>>,
+    <X::Output as Future>::Output: ExecResult,
+    C: Config,
+{
+    let control = sv.control.read();
+    if control.stop_spawning {
+        return None;
+    }
+    let entry = sv.context.book().vacant_entry(group_no);
+    let addr = entry.addr();
+    drop(control);
+
+    let span = error_span!(
+        parent: Span::none(),
+        "",
+        actor_group = group_name.as_str(),
+        actor_key = key_str.as_str()
+    );
+    let meta = Arc::new(ActorMeta {
+        group: group_name,
+        key: key_str,
+    });
+    let boxed = Box::new(Actor::new(
+        meta.clone(),
+        addr,
+        &system_config.mailbox,
+        termination_policy,
+        status_sub,
+    ));
+
+    let scope = Scope::new(
+        scope::trace_id(),
+        addr,
+        meta.clone(),
+        sv.scope_shared.clone(),
+    )
+    .with_telemetry(&system_config.telemetry);
+    drop(system_config);
+
+    let body = build_actor_body(sv.clone(), ctx, key, start_info, span, addr, backoff);
+
+    entry.insert(Object::new(addr, boxed));
+
+    crate::task::Builder::new(scope)
+        .spawn(body)
+        .expect("spawn an actor's task");
+
+    // Register the actor in the book to make it reachable.
+    let object = sv.context.book().get_owned(addr).expect("just created");
+    Some(object)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_actor_body<R, C, X>(
+    sv: Arc<Supervisor<R, C, X>>,
+    ctx: Context<C, R::Key>,
+    key: R::Key,
+    start_info: ActorStartInfo,
+    span: Span,
+    addr: Addr,
+    mut backoff: RestartBackoff,
+) -> impl Future<Output = ()> + Send + 'static
+where
+    R: Router<C>,
+    X: Exec<Context<C, R::Key>>,
+    <X::Output as Future>::Output: ExecResult,
+    C: Config,
+{
+    #[cfg(feature = "unstable-stuck-detection")]
+    let stuck_detector = sv.rt_manager.stuck_detector();
+
+    let fut = async move {
+        let thread = std::thread::current();
+
+        info!(%addr, thread = %thread.name().unwrap_or("?"), "started");
+
+        sv.objects
+            .get(&key)
+            .expect("where is the current actor?")
+            .as_actor()
+            .expect("a supervisor stores only actors")
+            .on_start();
+
+        // It must be called after `entry.insert()`.
+        let ctx = ctx.with_addr(addr).with_start_info(start_info);
+        let fut = async { sv.exec.exec(ctx).await.unify() };
+        let new_status = match panic::catch(fut).await {
+            Ok(Ok(())) => ActorStatus::TERMINATED,
+            Ok(Err(err)) => ActorStatus::FAILED.with_details(ErrorChain(&*err)),
+            Err(panic) => ActorStatus::FAILED.with_details(panic),
+        };
+
+        let restart_after = {
+            let object = sv.objects.get(&key).expect("where is the current actor?");
+
+            let actor = object.as_actor().expect("a supervisor stores only actors");
+
+            // Select the restart policy with the following priority: actor override >
+            // config override > blueprint restart policy..
+            let default_restart_policy = sv
+                .control
+                .read()
+                .system_config
+                .restart_policy
+                .make_policy()
+                .unwrap_or(sv.restart_policy.clone());
+            let restart_policy = actor.restart_policy().unwrap_or(default_restart_policy);
+
+            let restarting_allowed =
+                restart_policy.restarting_allowed(&new_status) && !sv.control.read().stop_spawning;
+
+            actor.set_status(new_status);
+
+            restarting_allowed
+                .then(|| {
+                    restart_policy
+                        .restart_params()
+                        .and_then(|p| backoff.next(&p))
+                })
+                .flatten()
+        };
+
+        let _ = if let Some(after) = restart_after {
+            if after == Duration::ZERO {
+                debug!("actor will be restarted immediately");
+            } else {
+                debug!(?after, "actor will be restarted");
+
+                increment_gauge!("elfo_restarting_actors", 1.);
+                tokio::time::sleep(after).await;
+                decrement_gauge!("elfo_restarting_actors", 1.);
+            }
+
+            // Restarted actors should have a new trace id.
+            scope::set_trace_id(TraceId::generate());
+
+            backoff.start();
+
+            match sv.spawn(key.clone(), ActorStartInfo::on_restart(), backoff) {
+                SpawnResult::Spawned(object) => sv.objects.insert(key.clone(), object),
+                SpawnResult::SpawnStopped => sv.objects.remove(&key).map(|(_, v)| v),
+                // it is already on target rt
+                SpawnResult::WaitRemoteSpawn(_) => unreachable!(),
+            }
+        } else {
+            debug!("actor won't be restarted");
+            sv.objects.remove(&key).map(|(_, v)| v)
+        }
+        .expect("where is the current actor?");
+
+        // TODO: should we unregister the address right after failure?
+        sv.context.book().remove(addr);
+    };
+
+    // tokio-console complains about futures larger than 1KiB even if tokio boxes
+    // such futures by itself, so we reduce noise in the console this way =(
+    #[cfg(all(tokio_unstable, feature = "tokio-tracing"))]
+    let fut = Box::pin(fut);
+
+    #[cfg(feature = "unstable-stuck-detection")]
+    let wrapped = MeasurePoll::new(fut.instrument(span), stuck_detector);
+    #[cfg(not(feature = "unstable-stuck-detection"))]
+    let wrapped = MeasurePoll::new(fut.instrument(span));
+
+    wrapped
+}
+
+#[derive(Default)]
+struct PendingRemoteSpawn {
+    in_flight: Mutex<bool>,
+    cv: Condvar,
+}
+
+impl PendingRemoteSpawn {
+    fn wait_for_slot(&self) {
+        let mut in_flight = self.in_flight.lock();
+        while *in_flight {
+            self.cv.wait(&mut in_flight);
+        }
+    }
+}
+
+struct InFlightGuard(Arc<PendingRemoteSpawn>);
+
+impl InFlightGuard {
+    fn arm(pending: Arc<PendingRemoteSpawn>) -> Self {
+        *pending.in_flight.lock() = true;
+        Self(pending)
+    }
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        let mut in_flight = self.0.in_flight.lock();
+        *in_flight = false;
+        self.0.cv.notify_all();
     }
 }
 

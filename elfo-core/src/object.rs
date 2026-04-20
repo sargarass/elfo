@@ -81,9 +81,8 @@ impl<P> Clone for MappedOwnedObject<P> {
 }
 
 #[derive(From)]
-#[allow(clippy::large_enum_variant)]
 pub(crate) enum ObjectKind {
-    Actor(Actor),
+    Actor(Box<Actor>),
     Group(Box<dyn GroupHandle>),
     #[cfg(feature = "network")]
     Remote(Box<dyn RemoteHandle>),
