@@ -23,7 +23,7 @@ use crate::{
     demux::Demux,
     dumping::{Direction, Dump, Dumper, INTERNAL_CLASS},
     envelope::{Envelope, MessageKind},
-    errors::{RequestError, SendError, TryRecvError, TrySendError},
+    errors::{ClosedBy, RequestError, SendError, TryRecvError, TryRecvWithError, TrySendError},
     mailbox::RecvResult,
     message::{Message, Request},
     messages, msg,
@@ -33,6 +33,7 @@ use crate::{
     routers::Singleton,
     scope,
     source::{SourceHandle, Sources, UnattachedSource},
+    wire::WireReceiver,
 };
 
 use self::stats::Stats;
@@ -825,6 +826,152 @@ impl<C, K> Context<C, K> {
 
                 self.stats.on_empty_mailbox();
                 return Err(TryRecvError::Empty);
+            };
+
+            if let Some(envelope) = self.post_recv(envelope) {
+                return Ok(envelope);
+            }
+        }
+    }
+
+    /// Receives the next envelope from `wire`, the actor's mailbox, or
+    /// any attached sources — whichever is ready first. Same `pre`/`post`
+    /// hooks as [`Self::recv`] (stats, coop budget, actor-stage
+    /// transition, trace-id setup, dumping, `Ping`/`UpdateConfig`
+    /// auto-handling).
+    ///
+    /// Returns `Ok(envelope)` on data, `Err(ClosedBy::*)` once the
+    /// corresponding input is closed and drained.
+    pub async fn recv_with(&mut self, wire: &mut WireReceiver) -> Result<Envelope, ClosedBy>
+    where
+        C: 'static,
+    {
+        'outer: loop {
+            self.pre_recv().await;
+
+            let envelope = 'received: {
+                let mailbox_fut = match self.consumer.as_mut() {
+                    Some(c) => c.recv(),
+                    None => return Err(ClosedBy::Mailbox),
+                };
+                pin_mut!(mailbox_fut);
+                let wire_fut = wire.recv();
+                pin_mut!(wire_fut);
+
+                tokio::select! {
+                    result = mailbox_fut => match result {
+                        RecvResult::Data(envelope) => break 'received envelope,
+                        RecvResult::Closed(trace_id) => {
+                            scope::set_trace_id(trace_id);
+                            if let Some(actor) = self.actor.as_deref() {
+                                on_input_closed(&mut self.stage, actor);
+                            }
+                            return Err(ClosedBy::Mailbox);
+                        }
+                    },
+                    option = wire_fut => {
+                        let Some(envelope) = option else {
+                            return Err(ClosedBy::Wire);
+                        };
+                        break 'received envelope;
+                    },
+                    option = self.sources.next(), if !self.sources.is_empty() => {
+                        let envelope = ward!(option, continue 'outer);
+                        break 'received envelope;
+                    },
+                }
+            };
+
+            if let Some(envelope) = self.post_recv(envelope) {
+                return Ok(envelope);
+            }
+        }
+    }
+
+    /// Non-blocking variant of [`Self::recv_with`]: polls the mailbox, the
+    /// `wire`, and any attached sources in order. Same `pre`/`post` hooks
+    /// as [`Self::try_recv`].
+    pub async fn try_recv_with(
+        &mut self,
+        wire: &mut WireReceiver,
+    ) -> Result<Envelope, TryRecvWithError>
+    where
+        C: 'static,
+    {
+        #[allow(clippy::never_loop)] // false positive
+        loop {
+            self.pre_recv().await;
+
+            let envelope = 'received: {
+                let consumer = match self.consumer.as_mut() {
+                    Some(c) => c,
+                    None => return Err(TryRecvWithError::Closed(ClosedBy::Mailbox)),
+                };
+
+                macro_rules! check_mailbox {
+                    () => {
+                        match consumer.try_recv() {
+                            Some(RecvResult::Data(envelope)) => break 'received envelope,
+                            Some(RecvResult::Closed(trace_id)) => {
+                                scope::set_trace_id(trace_id);
+                                let actor =
+                                    self.actor.as_deref().expect("actor should be set");
+                                on_input_closed(&mut self.stage, actor);
+                                return Err(TryRecvWithError::Closed(ClosedBy::Mailbox));
+                            }
+                            None => {}
+                        }
+                    };
+                }
+                macro_rules! check_wire {
+                    () => {
+                        match wire.try_recv() {
+                            Some(RecvResult::Data(envelope)) => break 'received envelope,
+                            Some(RecvResult::Closed(_)) => {
+                                return Err(TryRecvWithError::Closed(ClosedBy::Wire));
+                            }
+                            None => {}
+                        }
+                    };
+                }
+                macro_rules! check_sources {
+                    () => {
+                        if !self.sources.is_empty() {
+                            let envelope = poll_fn(|cx| {
+                                match Pin::new(&mut self.sources).poll_next(cx) {
+                                    Poll::Ready(Some(envelope)) => Poll::Ready(Some(envelope)),
+                                    _ => Poll::Ready(None),
+                                }
+                            })
+                            .await;
+                            if let Some(envelope) = envelope {
+                                break 'received envelope;
+                            }
+                        }
+                    };
+                }
+
+                // Cyclic random rotation: each input is first ~1/3 of the time.
+                match fastrand::u8(..3) {
+                    0 => {
+                        check_mailbox!();
+                        check_wire!();
+                        check_sources!();
+                    }
+                    1 => {
+                        check_wire!();
+                        check_sources!();
+                        check_mailbox!();
+                    }
+                    _ => {
+                        check_sources!();
+                        check_mailbox!();
+                        check_wire!();
+                    }
+                }
+
+                self.stats.on_empty_mailbox();
+                return Err(TryRecvWithError::Empty);
             };
 
             if let Some(envelope) = self.post_recv(envelope) {

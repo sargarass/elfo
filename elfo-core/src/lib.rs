@@ -48,6 +48,7 @@ pub mod task;
 pub mod time;
 pub mod topology;
 pub mod tracing;
+pub mod wire;
 
 mod actor;
 mod actor_status;

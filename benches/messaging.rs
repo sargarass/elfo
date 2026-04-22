@@ -7,7 +7,7 @@ use criterion::{BenchmarkId, Criterion, Throughput, criterion_group};
 use derive_more::Display;
 
 use elfo::{
-    Addr, Local,
+    Addr, Local, MoveOwnership,
     config::AnyConfig,
     messages::UpdateConfig,
     prelude::*,
@@ -55,12 +55,18 @@ struct ResolveAddrs;
 #[message(ret = Local<Instant>)]
 struct Summarize;
 
+#[message(ret = MoveOwnership<elfo::wire::WireSender>)]
+struct TakeWire {
+    key: u32,
+}
+
 // === Flags ===
 
 type Flags = u8;
 
 const SEND_ROUTED: Flags = 1 << 0; // send using the routing subsystem
 const SEND_DIRECT: Flags = 1 << 1; // send directly by an address
+const SEND_WIRE: Flags = 1 << 2; // send via the Wire SPSC primitive (one-to-one only)
 
 const ONE_TO_ONE: Flags = 1 << 5; // dedicated receiver for each sender
 const ROUND_ROBIN: Flags = 1 << 6; // round-robin distribution
@@ -101,6 +107,21 @@ fn make_producers<const FLAGS: Flags>(actor_count: u32, iter_count: u32) -> Blue
                 .collect::<Vec<_>>();
 
             let key = *ctx.key();
+
+            // Pick up the sender from the paired consumer.
+            let mut wire_sender = if flag!(SEND_WIRE) {
+                let tx = ctx
+                    .request(TakeWire { key })
+                    .resolve()
+                    .await
+                    .unwrap()
+                    .take()
+                    .unwrap();
+                Some(tx)
+            } else {
+                None
+            };
+
             let start_at = Instant::now();
 
             for i in 0..iter_count {
@@ -122,6 +143,8 @@ fn make_producers<const FLAGS: Flags>(actor_count: u32, iter_count: u32) -> Blue
                     ctx.send_to(consumer_addrs[value as usize], sample)
                         .await
                         .unwrap();
+                } else if flag!(SEND_WIRE) {
+                    wire_sender.as_mut().unwrap().send(sample).await.unwrap();
                 }
 
                 // Yield the current task to make the benchmark more realistic.
@@ -144,6 +167,7 @@ fn make_consumers<const FLAGS: Flags>(actor_count: u32) -> Blueprint {
             msg!(match envelope {
                 UpdateConfig | ResolveAddrs | Summarize =>
                     Outcome::Multicast((0..actor_count).collect()),
+                TakeWire { key } => Outcome::Unicast(*key),
                 Sample { value, .. } => {
                     assert!(*value < actor_count);
                     Outcome::Unicast(*value)
@@ -154,21 +178,99 @@ fn make_consumers<const FLAGS: Flags>(actor_count: u32) -> Blueprint {
         .exec(move |mut ctx| async move {
             // Measure throughput without extra context switches.
             // The number of switches are controlled by `yield_now()` in producers.
-            ctx.set_mailbox_capacity(1_000_000);
+            ctx.set_mailbox_capacity(10_000_000);
 
-            while let Some(envelope) = ctx.recv().await {
-                msg!(match envelope {
-                    msg @ Sample => {
-                        black_box(msg);
+            if flag!(SEND_WIRE) {
+                let (tx, mut rx) = elfo::wire::wire(10_000_000);
+                let mut wire_sender = Some(tx);
+
+                // Phase 1: handshake (ResolveAddrs + TakeWire) via mailbox.
+                loop {
+                    let envelope = match ctx.recv().await {
+                        Some(e) => e,
+                        None => return,
+                    };
+                    let handed_off = msg!(match envelope {
+                        (ResolveAddrs, token) => {
+                            ctx.respond(token, ctx.addr().into());
+                            false
+                        }
+                        (TakeWire, token) => {
+                            ctx.respond(token, wire_sender.take().unwrap().into());
+                            true
+                        }
+                        (Summarize, token) => {
+                            ctx.respond(token, Instant::now().into());
+                            return;
+                        }
+                        _ => false,
+                    });
+                    if handed_off {
+                        break;
                     }
-                    (ResolveAddrs, token) => {
-                        ctx.respond(token, ctx.addr().into());
-                    }
-                    (Summarize, token) => {
-                        ctx.respond(token, Instant::now().into());
+                }
+
+                loop {
+                    let envelope = match ctx.recv_with(&mut rx).await {
+                        Ok(e) => e,
+                        Err(elfo::errors::ClosedBy::Mailbox) => return,
+                        Err(elfo::errors::ClosedBy::Wire) => break,
+                    };
+                    let done = msg!(match envelope {
+                        msg @ Sample => {
+                            black_box(msg);
+                            false
+                        }
+                        (ResolveAddrs, token) => {
+                            ctx.respond(token, ctx.addr().into());
+                            false
+                        }
+                        (Summarize, token) => {
+                            ctx.respond(token, Instant::now().into());
+                            true
+                        }
+                        _ => unreachable!(),
+                    });
+                    if done {
                         return;
                     }
-                });
+                }
+
+                loop {
+                    let envelope = match ctx.recv().await {
+                        Some(e) => e,
+                        None => return,
+                    };
+                    let done = msg!(match envelope {
+                        (ResolveAddrs, token) => {
+                            ctx.respond(token, ctx.addr().into());
+                            false
+                        }
+                        (Summarize, token) => {
+                            ctx.respond(token, Instant::now().into());
+                            true
+                        }
+                        _ => unreachable!(),
+                    });
+                    if done {
+                        return;
+                    }
+                }
+            } else {
+                while let Some(envelope) = ctx.recv().await {
+                    msg!(match envelope {
+                        msg @ Sample => {
+                            black_box(msg);
+                        }
+                        (ResolveAddrs, token) => {
+                            ctx.respond(token, ctx.addr().into());
+                        }
+                        (Summarize, token) => {
+                            ctx.respond(token, Instant::now().into());
+                            return;
+                        }
+                    });
+                }
             }
         })
 }
@@ -227,8 +329,9 @@ async fn run<const FLAGS: Flags>(
 }
 
 fn make_name<const FLAGS: Flags>() -> (&'static str, &'static str) {
-    assert_only_one_flag!(SEND_ROUTED SEND_DIRECT);
+    assert_only_one_flag!(SEND_ROUTED SEND_DIRECT SEND_WIRE);
     assert_only_one_flag!(ONE_TO_ONE ROUND_ROBIN ALL_TO_ONE);
+    assert!(!flag!(SEND_WIRE) || flag!(ONE_TO_ONE), "wire is SPSC");
 
     let group_id = if flag!(ONE_TO_ONE) {
         "one_to_one"
@@ -244,6 +347,8 @@ fn make_name<const FLAGS: Flags>() -> (&'static str, &'static str) {
         "send_routed"
     } else if flag!(SEND_DIRECT) {
         "send_direct"
+    } else if flag!(SEND_WIRE) {
+        "send_wire"
     } else {
         unreachable!()
     };
@@ -321,4 +426,9 @@ fn send_direct(c: &mut Criterion) {
     case::<{ SEND_DIRECT | ALL_TO_ONE }>(c);
 }
 
-criterion_group!(cases, send_routed, send_direct);
+// Sends messages via the Wire SPSC primitive (one-to-one only).
+fn send_wire(c: &mut Criterion) {
+    case::<{ SEND_WIRE | ONE_TO_ONE }>(c);
+}
+
+criterion_group!(cases, send_routed, send_direct, send_wire);

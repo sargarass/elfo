@@ -188,3 +188,37 @@ impl TryRecvError {
         matches!(self, Self::Closed)
     }
 }
+
+// === ClosedBy / TryRecvWithError ===
+
+/// Identifies which input of `Context::recv_with` / `Context::try_recv_with`
+/// was observed closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Display, Error)]
+pub enum ClosedBy {
+    #[display("mailbox closed")]
+    Mailbox,
+    #[display("wire closed")]
+    Wire,
+}
+
+#[derive(Debug, Clone, Display, Error)]
+pub enum TryRecvWithError {
+    /// No input had a message ready.
+    #[display("empty")]
+    Empty,
+    /// One of the inputs was closed.
+    #[display("{_0}")]
+    Closed(ClosedBy),
+}
+
+impl TryRecvWithError {
+    #[inline]
+    pub fn is_empty(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    #[inline]
+    pub fn is_closed(&self) -> bool {
+        matches!(self, Self::Closed(_))
+    }
+}
