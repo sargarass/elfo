@@ -154,7 +154,7 @@ fn make_consumers<const FLAGS: Flags>(actor_count: u32) -> Blueprint {
         .exec(move |mut ctx| async move {
             // Measure throughput without extra context switches.
             // The number of switches are controlled by `yield_now()` in producers.
-            ctx.set_mailbox_capacity(1_000_000);
+            ctx.set_mailbox_capacity(10_000_000);
 
             while let Some(envelope) = ctx.recv().await {
                 msg!(match envelope {
