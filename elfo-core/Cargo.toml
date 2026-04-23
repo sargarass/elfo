@@ -39,6 +39,7 @@ tracing.workspace = true
 idr-ebr = "0.3.2"
 futures-intrusive = "0.5"
 cordyceps = "0.3.2"
+diatomic-waker = "0.2"
 smallbox = "0.8.0"
 static_assertions = "1.1.0"
 fxhash = "0.2.1"

@@ -25,14 +25,19 @@
 //!             └─────────────────────────────────────────────┘
 //! ```
 
-use std::ptr::{self, NonNull};
+use std::{
+    future::poll_fn,
+    ptr::{self, NonNull},
+    task::Poll,
+};
 
 use cordyceps::{
     Linked,
     mpsc_queue::{Links, MpscQueue},
 };
+use diatomic_waker::DiatomicWaker;
 use parking_lot::Mutex;
-use tokio::sync::{Notify, Semaphore, TryAcquireError};
+use tokio::sync::{Semaphore, TryAcquireError};
 
 use elfo_utils::CachePadded;
 
@@ -122,11 +127,13 @@ pub(crate) struct Mailbox {
 
     /// A notifier of senders about the availability of new messages.
     // TODO: replace with a custom semaphore based on `async-event` (10-15% faster).
-    tx_semaphore: Semaphore,
+    tx_semaphore: CachePadded<Semaphore>,
 
     /// A notifier of a receiver about the availability of new messages.
-    // TODO: replace with `diatomic-waker` (3-5% faster).
-    rx_notify: CachePadded<Notify>,
+    // UNSAFE PERF VARIANT: DiatomicWaker is single-sink, so this is only
+    // sound if no two consumers can call `recv`/`drop_all` concurrently.
+    // The existing race with `drop_all()` is ignored here for benchmarking.
+    rx_waker: CachePadded<DiatomicWaker>,
 
     /// Use `Mutex` here for synchronization on close/configure.
     control: Mutex<Control>,
@@ -145,8 +152,8 @@ impl Mailbox {
 
         Self {
             queue: MpscQueue::new_with_stub(Envelope::stub()),
-            tx_semaphore: Semaphore::new(capacity),
-            rx_notify: CachePadded::new(Notify::new()),
+            tx_semaphore: CachePadded::new(Semaphore::new(capacity)),
+            rx_waker: CachePadded::new(DiatomicWaker::new()),
             control: Mutex::new(Control {
                 closed_trace_id: None,
                 capacity,
@@ -185,7 +192,7 @@ impl Mailbox {
 
         permit.forget();
         self.queue.enqueue(envelope);
-        self.rx_notify.notify_one();
+        self.rx_waker.notify();
         Ok(())
     }
 
@@ -194,7 +201,7 @@ impl Mailbox {
             Ok(permit) => {
                 permit.forget();
                 self.queue.enqueue(envelope);
-                self.rx_notify.notify_one();
+                self.rx_waker.notify();
                 Ok(())
             }
             Err(TryAcquireError::NoPermits) => Err(TrySendError::Full(envelope)),
@@ -218,33 +225,52 @@ impl Mailbox {
         }
 
         self.queue.enqueue(envelope);
-        self.rx_notify.notify_one();
+        self.rx_waker.notify();
 
         Ok(())
     }
 
     pub(crate) async fn recv(&self) -> RecvResult {
-        loop {
-            // TODO: it should be possible to use `dequeue_unchecked()` here.
-            // Preliminarily, we should guarantee that it can be called only
-            // by one consumer. However, it's not enough to create a dedicated
-            // `MailboxConsumer` because users can steal `Context` to another
-            // task/thread and create a race with the `drop_all()` method.
-            if let Some(envelope) = self.queue.dequeue() {
+        // UNSAFE PERF VARIANT: using DiatomicWaker + dequeue_unchecked requires
+        // a single-consumer invariant which the current elfo API does NOT
+        // statically guarantee (drop_all is a second consumer path). This is
+        // accepted for the benchmark comparison only.
+        poll_fn(|cx| {
+            // Fast path.
+            // SAFETY: single-consumer assumption (see note above).
+            if let Some(envelope) = unsafe { self.queue.dequeue_unchecked() } {
                 self.tx_semaphore.add_permits(1);
-                return RecvResult::Data(envelope);
+                return Poll::Ready(RecvResult::Data(envelope));
             }
-
             if self.tx_semaphore.is_closed() {
-                return self.on_close();
+                return Poll::Ready(self.on_close());
             }
 
-            self.rx_notify.notified().await;
-        }
+            // SAFETY: single-sink assumption (see note above).
+            unsafe { self.rx_waker.register(cx.waker()) };
+
+            // Recheck after register.
+            // SAFETY: see above.
+            if let Some(envelope) = unsafe { self.queue.dequeue_unchecked() } {
+                // SAFETY: see above.
+                unsafe { self.rx_waker.unregister() };
+                self.tx_semaphore.add_permits(1);
+                return Poll::Ready(RecvResult::Data(envelope));
+            }
+            if self.tx_semaphore.is_closed() {
+                // SAFETY: see above.
+                unsafe { self.rx_waker.unregister() };
+                return Poll::Ready(self.on_close());
+            }
+
+            Poll::Pending
+        })
+        .await
     }
 
     pub(crate) fn try_recv(&self) -> Option<RecvResult> {
-        match self.queue.dequeue() {
+        // SAFETY: single-consumer assumption (see `recv` note).
+        match unsafe { self.queue.dequeue_unchecked() } {
             Some(envelope) => {
                 self.tx_semaphore.add_permits(1);
                 Some(RecvResult::Data(envelope))
@@ -269,19 +295,21 @@ impl Mailbox {
         control.closed_trace_id = Some(trace_id);
 
         self.tx_semaphore.close();
-        self.rx_notify.notify_one();
+        self.rx_waker.notify();
         true
     }
 
     #[cold]
     pub(crate) fn drop_all(&self) {
-        while self.queue.dequeue().is_some() {}
+        // SAFETY: single-consumer assumption (see `recv` note).
+        while unsafe { self.queue.dequeue_unchecked() }.is_some() {}
     }
 
     #[cold]
     fn on_close(&self) -> RecvResult {
         // Some messages may be in the queue after the channel is closed.
-        match self.queue.dequeue() {
+        // SAFETY: single-consumer assumption (see `recv` note).
+        match unsafe { self.queue.dequeue_unchecked() } {
             Some(envelope) => RecvResult::Data(envelope),
             None => {
                 let control = self.control.lock();
