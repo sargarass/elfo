@@ -25,7 +25,10 @@
 //!             └─────────────────────────────────────────────┘
 //! ```
 
-use std::ptr::{self, NonNull};
+use std::{
+    ops::Deref,
+    ptr::{self, NonNull},
+};
 
 use cordyceps::{
     Linked,
@@ -105,7 +108,8 @@ unsafe impl Linked<Link> for EnvelopeHeader {
     unsafe fn links(ptr: NonNull<Self>) -> NonNull<Link> {
         // Using `ptr::addr_of_mut!` permits us to avoid creating a temporary
         // reference without using layout-dependent casts.
-        // SAFETY: `ptr` is valid for reads and points to a properly initialized `EnvelopeHeader`.
+        // SAFETY: `ptr` is valid for reads and points to a properly initialized
+        // `EnvelopeHeader`.
         let links = unsafe { ptr::addr_of_mut!((*ptr.as_ptr()).link) };
 
         // SAFETY: `NonNull::new_unchecked` is safe to use here, because the pointer
@@ -137,6 +141,8 @@ struct Control {
     closed_trace_id: Option<TraceId>,
     /// A real capacity of the mailbox.
     capacity: usize,
+    /// Whether a `MailboxConsumer` is currently attached to this mailbox.
+    consumer_attached: bool,
 }
 
 impl Mailbox {
@@ -150,6 +156,7 @@ impl Mailbox {
             control: Mutex::new(Control {
                 closed_trace_id: None,
                 capacity,
+                consumer_attached: false,
             }),
         }
     }
@@ -223,35 +230,16 @@ impl Mailbox {
         Ok(())
     }
 
-    pub(crate) async fn recv(&self) -> RecvResult {
-        loop {
-            // TODO: it should be possible to use `dequeue_unchecked()` here.
-            // Preliminarily, we should guarantee that it can be called only
-            // by one consumer. However, it's not enough to create a dedicated
-            // `MailboxConsumer` because users can steal `Context` to another
-            // task/thread and create a race with the `drop_all()` method.
-            if let Some(envelope) = self.queue.dequeue() {
-                self.tx_semaphore.add_permits(1);
-                return RecvResult::Data(envelope);
-            }
-
-            if self.tx_semaphore.is_closed() {
-                return self.on_close();
-            }
-
-            self.rx_notify.notified().await;
+    /// Closes the mailbox and drains pending messages, if no
+    /// `MailboxConsumer` is attached.
+    #[cold]
+    pub(crate) fn close_if_unattached(&self, trace_id: TraceId) -> bool {
+        if self.control.lock().consumer_attached {
+            return false;
         }
-    }
-
-    pub(crate) fn try_recv(&self) -> Option<RecvResult> {
-        match self.queue.dequeue() {
-            Some(envelope) => {
-                self.tx_semaphore.add_permits(1);
-                Some(RecvResult::Data(envelope))
-            }
-            None if self.tx_semaphore.is_closed() => Some(self.on_close()),
-            None => None,
-        }
+        let _ = self.close(trace_id);
+        while self.queue.dequeue().is_some() {}
+        true
     }
 
     #[cold]
@@ -272,23 +260,71 @@ impl Mailbox {
         self.rx_notify.notify_one();
         true
     }
+}
 
-    #[cold]
-    pub(crate) fn drop_all(&self) {
-        while self.queue.dequeue().is_some() {}
+// === MailboxConsumer ===
+
+/// The unique consumer half of a [`Mailbox`].
+///
+/// Single-consumer is enforced at runtime via `Control::consumer_attached`.
+pub(crate) struct MailboxConsumer<D: Deref<Target = Mailbox>>(D);
+
+impl<D: Deref<Target = Mailbox>> MailboxConsumer<D> {
+    /// Panics if a `MailboxConsumer` is already attached to `inner`.
+    pub(crate) fn new(inner: D) -> Self {
+        let mut control = inner.control.lock();
+        assert!(
+            !control.consumer_attached,
+            "a `MailboxConsumer` is already attached to this mailbox",
+        );
+        control.consumer_attached = true;
+        drop(control);
+        Self(inner)
+    }
+
+    pub(crate) async fn recv(&mut self) -> RecvResult {
+        loop {
+            if let Some(envelope) = self.0.queue.dequeue() {
+                self.0.tx_semaphore.add_permits(1);
+                return RecvResult::Data(envelope);
+            }
+
+            if self.0.tx_semaphore.is_closed() {
+                return self.on_close();
+            }
+
+            self.0.rx_notify.notified().await;
+        }
+    }
+
+    pub(crate) fn try_recv(&mut self) -> Option<RecvResult> {
+        match self.0.queue.dequeue() {
+            Some(envelope) => {
+                self.0.tx_semaphore.add_permits(1);
+                Some(RecvResult::Data(envelope))
+            }
+            None if self.0.tx_semaphore.is_closed() => Some(self.on_close()),
+            None => None,
+        }
     }
 
     #[cold]
     fn on_close(&self) -> RecvResult {
         // Some messages may be in the queue after the channel is closed.
-        match self.queue.dequeue() {
+        match self.0.queue.dequeue() {
             Some(envelope) => RecvResult::Data(envelope),
             None => {
-                let control = self.control.lock();
+                let control = self.0.control.lock();
                 let trace_id = control.closed_trace_id.expect("called before close()");
                 RecvResult::Closed(trace_id)
             }
         }
+    }
+}
+
+impl<D: Deref<Target = Mailbox>> Drop for MailboxConsumer<D> {
+    fn drop(&mut self) {
+        self.0.control.lock().consumer_attached = false;
     }
 }
 
