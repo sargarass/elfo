@@ -23,8 +23,8 @@ use crate::{
     restarting::RestartPolicy,
     scope,
     subscription::SubscriptionManager,
+    tracing::TraceId,
 };
-
 // === ActorMeta ===
 
 /// Represents meta information about actor: his group and key.
@@ -207,6 +207,13 @@ impl Actor {
         let mailbox =
             MappedOwnedObject::map(entry, |obj| &obj.as_actor().expect("actor object").mailbox);
         MailboxConsumer::new(mailbox)
+    }
+
+    pub(crate) fn transfer_messages(&self, target: &Actor, trace_id: TraceId) {
+        let consumer = MailboxConsumer::new(&self.mailbox);
+        consumer
+            .transfer_messages(&target.mailbox, trace_id)
+            .expect("transferred");
     }
 
     pub(crate) fn request_table(&self) -> &RequestTable {

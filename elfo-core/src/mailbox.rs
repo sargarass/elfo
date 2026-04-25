@@ -339,6 +339,22 @@ impl<D: Deref<Target = Mailbox>> MailboxConsumer<D> {
         }
     }
 
+    pub(crate) fn transfer_messages(
+        &self,
+        target: &Mailbox,
+        trace_id: TraceId,
+    ) -> Result<(), TrySendError<Envelope>> {
+        let mut self_control = self.0.control.lock();
+        self.0.close_inner(&mut self_control, trace_id);
+        // Safety: This is a single consumer of the queue.
+        while let Some(e) = unsafe { self.0.queue.dequeue_unchecked() } {
+            if let Err(TrySendError::Full(t)) = target.try_send(e) {
+                target.unbounded_send(t)?;
+            }
+        }
+        Ok(())
+    }
+
     #[cold]
     fn on_close(&self) -> RecvResult {
         // Some messages may be in the queue after the channel is closed.

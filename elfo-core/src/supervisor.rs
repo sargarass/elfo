@@ -1,13 +1,10 @@
 use std::{future::Future, mem, ops::Deref, sync::Arc, time::Duration};
 
-use dashmap::{
-    DashMap,
-    Entry::{Occupied, Vacant},
-};
+use dashmap::DashMap;
 use futures::future::BoxFuture;
 use fxhash::FxBuildHasher;
 use metrics::{decrement_gauge, increment_gauge};
-use parking_lot::{Condvar, Mutex, RwLock};
+use parking_lot::RwLock;
 use tracing::{Instrument, Span, debug, error, error_span, info, warn};
 
 use elfo_utils::CachePadded;
@@ -45,7 +42,6 @@ pub(crate) struct Supervisor<R: Router<C>, C, X> {
     span: Span,
     context: Context,
     objects: DashMap<R::Key, OwnedObject, FxBuildHasher>,
-    pending_remote_spawns: DashMap<R::Key, Arc<PendingRemoteSpawn>>,
     router: R,
     exec: X,
     control: CachePadded<RwLock<Control<C>>>,
@@ -61,32 +57,18 @@ struct Control<C> {
     stop_spawning: bool,
 }
 
-enum SpawnResult {
-    Spawned(OwnedObject),
-    SpawnStopped,
-    WaitRemoteSpawn(Arc<PendingRemoteSpawn>),
-}
-
 /// Returns `None` if cannot be spawned.
 macro_rules! get_or_spawn {
     ($this:ident, $key:expr, $start_info:expr) => {{
         let key = $key;
         match $this.objects.get(&key) {
             Some(object) => Some(object),
-            None => match $this.objects.entry(key.clone()) {
-                // FIXME(loyd): take an exclusive lock here.
-                Occupied(entry) => Some(entry.into_ref().downgrade()),
-                Vacant(entry) => match $this.spawn(key.clone(), $start_info, Default::default()) {
-                    // FIXME(loyd): take an exclusive lock here.
-                    SpawnResult::Spawned(object) => Some(entry.insert(object).downgrade()),
-                    SpawnResult::SpawnStopped => None,
-                    SpawnResult::WaitRemoteSpawn(pending) => {
-                        drop(entry);
-                        pending.wait_for_slot();
-                        $this.objects.get(&key)
-                    }
-                },
-            },
+            None => $this
+                .objects
+                .entry(key.clone())
+                .or_try_insert_with(|| $this.spawn(key, $start_info, Default::default()).ok_or(()))
+                .map(|o| o.downgrade()) // FIXME: take an exclusive lock here.
+                .ok(),
         }
     }};
 }
@@ -128,7 +110,6 @@ where
             restart_policy,
             termination_policy,
             objects: DashMap::default(),
-            pending_remote_spawns: Default::default(),
             router,
             exec,
             control: CachePadded::new(RwLock::new(control)),
@@ -295,58 +276,47 @@ where
         key: R::Key,
         start_info: ActorStartInfo,
         backoff: RestartBackoff,
-    ) -> SpawnResult {
+    ) -> Option<OwnedObject> {
+        let control = self.control.read();
+        if control.stop_spawning {
+            return None;
+        }
+
+        let group_no = self.context.group().group_no().expect("invalid group addr");
+        let system_config = control.system_config.clone();
+
+        let user_config = control
+            .user_config
+            .as_ref()
+            .cloned()
+            .expect("config is unset");
+
+        drop(control);
+
         let key_str = key.to_string();
         let group_name = self.meta.group.clone();
-        let rt_selection_meta = ActorMeta {
+        let meta = ActorMeta {
             group: group_name.clone(),
             key: key_str.clone(),
         };
-        let rt = self.rt_manager.get(&rt_selection_meta);
-        drop(rt_selection_meta);
-
-        let notify_waiters_by_key = |key| {
-            if let Some((_, pending)) = self.pending_remote_spawns.remove(key) {
-                let mut in_flight = pending.in_flight.lock();
-                *in_flight = false;
-                pending.cv.notify_all();
-            }
-        };
+        let rt = self.rt_manager.get(&meta);
 
         let on_target = tokio::runtime::Handle::try_current()
             .ok()
             .map(|cur| cur.id() == rt.id())
             .unwrap_or(false);
 
+        let termination_policy = self.termination_policy.clone();
+        let status_sub = self.status_subscription.clone();
+        let ctx = self
+            .context
+            .clone()
+            .with_key(key.clone())
+            .with_config(user_config);
+
         if on_target {
-            let control = self.control.read();
-            if control.stop_spawning {
-                notify_waiters_by_key(&key);
-                return SpawnResult::SpawnStopped;
-            }
-
-            let group_no = self.context.group().group_no().expect("invalid group addr");
-            let system_config = control.system_config.clone();
-
-            let user_config = control
-                .user_config
-                .as_ref()
-                .cloned()
-                .expect("config is unset");
-
-            drop(control);
-
-            let sv = self.clone();
-            let termination_policy = self.termination_policy.clone();
-            let status_sub = self.status_subscription.clone();
-            let ctx = self
-                .context
-                .clone()
-                .with_key(key.clone())
-                .with_config(user_config);
-
-            let actor = run_spawn(
-                sv,
+            let (object, start_task) = prepare_actor(
+                self,
                 ctx,
                 key.clone(),
                 start_info,
@@ -357,25 +327,22 @@ where
                 system_config,
                 termination_policy,
                 status_sub,
-            );
-            let res = match actor {
-                Some(actor) => SpawnResult::Spawned(actor),
-                None => SpawnResult::SpawnStopped,
-            };
-            notify_waiters_by_key(&key);
-            res
+            )?;
+            start_task();
+            Some(object)
         } else {
-            let pending = self
-                .pending_remote_spawns
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(PendingRemoteSpawn::default()))
-                .clone();
-
-            if *pending.in_flight.lock() {
-                return SpawnResult::WaitRemoteSpawn(pending);
-            }
-
-            let guard = InFlightGuard::arm(pending.clone());
+            // Set actor just to receive messages
+            let entry = self.context.book().vacant_entry(group_no);
+            let addr = entry.addr();
+            let boxed = Box::new(Actor::new(
+                Arc::new(meta),
+                addr,
+                &system_config.mailbox,
+                termination_policy,
+                status_sub,
+            ));
+            entry.insert(Object::new(addr, boxed));
+            let object = self.context.book().get_owned(addr).expect("just created");
 
             // We want this code to run on the tokio's worker thread to get all allocations
             // locally
@@ -383,26 +350,41 @@ where
                 let sv = self.clone();
                 let scope = scope::expose();
                 let f = move || {
-                    let _guard = guard;
-                    let Vacant(entry) = sv.objects.entry(key.clone()) else {
-                        // Another on-target caller already spawned this actor
-                        return;
-                    };
+                    let result = prepare_actor(
+                        &sv,
+                        ctx,
+                        key.clone(),
+                        start_info,
+                        backoff,
+                        group_no,
+                        group_name,
+                        key_str,
+                        system_config,
+                        sv.termination_policy.clone(),
+                        sv.status_subscription.clone(),
+                    );
 
-                    let object = match sv.spawn(key.clone(), start_info, backoff) {
-                        SpawnResult::Spawned(object) => object,
-                        SpawnResult::SpawnStopped => return,
-                        SpawnResult::WaitRemoteSpawn(_) => {
-                            unreachable!("worker is already on remote rt!")
+                    if let Some((object, start_task)) = result {
+                        {
+                            let mut object_mut = sv.objects.get_mut(&key).expect("object set");
+                            let actor_mut = object_mut.as_actor().expect("actor");
+                            actor_mut.transfer_messages(
+                                object.as_actor().expect("actor"),
+                                scope::trace_id(),
+                            );
+                            *object_mut = object;
                         }
+                        // Start the actor only after the placeholder mailbox has been
+                        // drained, so that it observes messages in their original order.
+                        start_task();
+                    } else {
+                        sv.objects.remove(&key);
                     };
-                    entry.insert(object);
                 };
-
                 async move { scope.sync_within(f) }
             });
 
-            SpawnResult::WaitRemoteSpawn(pending)
+            Some(object)
         }
     }
 
@@ -504,8 +486,8 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn run_spawn<R, C, X>(
-    sv: Arc<Supervisor<R, C, X>>,
+fn prepare_actor<R, C, X>(
+    sv: &Arc<Supervisor<R, C, X>>,
     ctx: Context<C, R::Key>,
     key: R::Key,
     start_info: ActorStartInfo,
@@ -516,20 +498,15 @@ fn run_spawn<R, C, X>(
     system_config: Arc<SystemConfig>,
     termination_policy: TerminationPolicy,
     status_sub: Arc<SubscriptionManager>,
-) -> Option<OwnedObject>
+) -> Option<(OwnedObject, impl FnOnce() + Send + 'static)>
 where
     R: Router<C>,
     X: Exec<Context<C, R::Key>>,
     <X::Output as Future>::Output: ExecResult,
     C: Config,
 {
-    let control = sv.control.read();
-    if control.stop_spawning {
-        return None;
-    }
     let entry = sv.context.book().vacant_entry(group_no);
     let addr = entry.addr();
-    drop(control);
 
     let span = error_span!(
         parent: Span::none(),
@@ -562,13 +539,15 @@ where
 
     entry.insert(Object::new(addr, boxed));
 
-    crate::task::Builder::new(scope)
-        .spawn(body)
-        .expect("spawn an actor's task");
-
     // Register the actor in the book to make it reachable.
     let object = sv.context.book().get_owned(addr).expect("just created");
-    Some(object)
+    let start_task = move || {
+        crate::task::Builder::new(scope)
+            .spawn(body)
+            .expect("spawn an actor's task");
+    };
+
+    Some((object, start_task))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -657,11 +636,10 @@ where
 
             backoff.start();
 
-            match sv.spawn(key.clone(), ActorStartInfo::on_restart(), backoff) {
-                SpawnResult::Spawned(object) => sv.objects.insert(key.clone(), object),
-                SpawnResult::SpawnStopped => sv.objects.remove(&key).map(|(_, v)| v),
-                // it is already on target rt
-                SpawnResult::WaitRemoteSpawn(_) => unreachable!(),
+            if let Some(object) = sv.spawn(key.clone(), ActorStartInfo::on_restart(), backoff) {
+                sv.objects.insert(key.clone(), object)
+            } else {
+                sv.objects.remove(&key).map(|(_, v)| v)
             }
         } else {
             debug!("actor won't be restarted");
@@ -684,38 +662,6 @@ where
     let wrapped = MeasurePoll::new(fut.instrument(span));
 
     wrapped
-}
-
-#[derive(Default)]
-struct PendingRemoteSpawn {
-    in_flight: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl PendingRemoteSpawn {
-    fn wait_for_slot(&self) {
-        let mut in_flight = self.in_flight.lock();
-        while *in_flight {
-            self.cv.wait(&mut in_flight);
-        }
-    }
-}
-
-struct InFlightGuard(Arc<PendingRemoteSpawn>);
-
-impl InFlightGuard {
-    fn arm(pending: Arc<PendingRemoteSpawn>) -> Self {
-        *pending.in_flight.lock() = true;
-        Self(pending)
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        let mut in_flight = self.0.in_flight.lock();
-        *in_flight = false;
-        self.0.cv.notify_all();
-    }
 }
 
 fn extract_response_token<R: Request>(envelope: Envelope) -> ResponseToken<R> {
