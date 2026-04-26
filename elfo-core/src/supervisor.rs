@@ -41,7 +41,9 @@ pub(crate) struct Supervisor<R: Router<C>, C, X> {
     termination_policy: TerminationPolicy,
     span: Span,
     context: Context,
-    objects: DashMap<R::Key, OwnedObject, FxBuildHasher>,
+    objects: papaya::HashMap<R::Key, OwnedObject, FxBuildHasher>,
+    //  Serializes concurrent `get_or_spawn` spawn path for the same key
+    spawn_locks: DashMap<R::Key, (), FxBuildHasher>,
     router: R,
     exec: X,
     control: CachePadded<RwLock<Control<C>>>,
@@ -55,22 +57,6 @@ struct Control<C> {
     user_config: Option<Arc<C>>,
     is_started: bool,
     stop_spawning: bool,
-}
-
-/// Returns `None` if cannot be spawned.
-macro_rules! get_or_spawn {
-    ($this:ident, $key:expr, $start_info:expr) => {{
-        let key = $key;
-        match $this.objects.get(&key) {
-            Some(object) => Some(object),
-            None => $this
-                .objects
-                .entry(key.clone())
-                .or_try_insert_with(|| $this.spawn(key, $start_info, Default::default()).ok_or(()))
-                .map(|o| o.downgrade()) // FIXME: take an exclusive lock here.
-                .ok(),
-        }
-    }};
 }
 
 impl<R, C, X> Supervisor<R, C, X>
@@ -109,7 +95,8 @@ where
             }),
             restart_policy,
             termination_policy,
-            objects: DashMap::default(),
+            objects: papaya::HashMap::default(),
+            spawn_locks: DashMap::default(),
             router,
             exec,
             control: CachePadded::new(RwLock::new(control)),
@@ -221,39 +208,68 @@ where
         });
 
         let start_info = ActorStartInfo::on_message();
+        let guard = self.objects.guard();
         match outcome {
-            Outcome::Unicast(key) => match get_or_spawn!(self, key, start_info) {
-                Some(object) => visitor.visit_last(&object, envelope),
+            Outcome::Unicast(key) => match self.get_or_spawn(key, start_info, &guard) {
+                Some(object) => visitor.visit_last(object, envelope),
                 None => visitor.empty(envelope),
             },
-            Outcome::GentleUnicast(key) => match self.objects.get(&key) {
-                Some(object) => visitor.visit_last(&object, envelope),
+            Outcome::GentleUnicast(key) => match self.objects.get(&key, &guard) {
+                Some(object) => visitor.visit_last(object, envelope),
                 None => visitor.empty(envelope),
             },
             Outcome::Multicast(list) => {
                 for key in list.iter() {
-                    if !self.objects.contains_key(key) {
-                        get_or_spawn!(self, key.clone(), start_info.clone());
-                    }
+                    self.get_or_spawn(key.clone(), start_info.clone(), &guard);
                 }
-                let iter = list.into_iter().filter_map(|key| self.objects.get(&key));
+                let iter = list.iter().filter_map(|key| self.objects.get(key, &guard));
                 self.visit_multiple(envelope, visitor, iter);
             }
             Outcome::GentleMulticast(list) => {
-                let iter = list.into_iter().filter_map(|key| self.objects.get(&key));
+                let iter = list.iter().filter_map(|key| self.objects.get(key, &guard));
                 self.visit_multiple(envelope, visitor, iter);
             }
-            Outcome::Broadcast => self.visit_multiple(envelope, visitor, self.objects.iter()),
+            Outcome::Broadcast => self.visit_multiple(
+                envelope,
+                visitor,
+                self.objects.iter(&guard).map(|(_, v)| v),
+            ),
             Outcome::Discard => visitor.empty(envelope),
             Outcome::Default => unreachable!("must be altered earlier"),
         }
     }
 
-    fn visit_multiple(
+    /// Returns `None` if the actor cannot be spawned (`stop_spawning`).
+    ///
+    /// Concurrent calls for the same key are serialized via the `spawn_locks`
+    /// dashmap, so `Self::spawn` runs at most once per key — preventing
+    /// orphan tokio tasks and address-book entries on contention.
+    fn get_or_spawn<'g>(
+        self: &Arc<Self>,
+        key: R::Key,
+        start_info: ActorStartInfo,
+        guard: &'g papaya::LocalGuard<'_>,
+    ) -> Option<&'g OwnedObject> {
+        if let Some(object) = self.objects.get(&key, guard) {
+            return Some(object);
+        }
+        // FIXME: do not hold guard here
+        let _slot = self.spawn_locks.entry(key.clone());
+        // Re-check under the lock: a racing thread may have inserted while
+        // we were waiting on the dashmap shard.
+        if let Some(object) = self.objects.get(&key, guard) {
+            return Some(object);
+        }
+        let spawned = self.spawn(key.clone(), start_info, Default::default())?;
+        self.objects.insert(key.clone(), spawned, guard);
+        self.objects.get(&key, guard)
+    }
+
+    fn visit_multiple<T: Deref<Target = OwnedObject>>(
         &self,
         envelope: Envelope,
         visitor: &mut dyn GroupVisitor,
-        iter: impl Iterator<Item = impl Deref<Target = OwnedObject>>,
+        iter: impl Iterator<Item = T>,
     ) {
         let mut iter = iter.peekable();
 
@@ -329,14 +345,15 @@ where
             let thread = std::thread::current();
 
             info!(%addr, thread = %thread.name().unwrap_or("?"), "started");
-
+            // serialize access to actor, so it is set
+            let _ = sv.spawn_locks.get(&key);
             sv.objects
+                .pin()
                 .get(&key)
                 .expect("where is the current actor?")
                 .as_actor()
                 .expect("a supervisor stores only actors")
                 .on_start();
-
             // It must be called after `entry.insert()`.
             let ctx = ctx.with_addr(addr).with_start_info(start_info);
             let fut = async { sv.exec.exec(ctx).await.unify() };
@@ -347,7 +364,8 @@ where
             };
 
             let restart_after = {
-                let object = sv.objects.get(&key).expect("where is the current actor?");
+                let pinned = sv.objects.pin();
+                let object = pinned.get(&key).expect("where is the current actor?");
 
                 let actor = object.as_actor().expect("a supervisor stores only actors");
 
@@ -376,7 +394,7 @@ where
                     .flatten()
             };
 
-            let _ = if let Some(after) = restart_after {
+            if let Some(after) = restart_after {
                 if after == Duration::ZERO {
                     debug!("actor will be restarted immediately");
                 } else {
@@ -391,16 +409,21 @@ where
                 scope::set_trace_id(TraceId::generate());
 
                 backoff.start();
+                let pinned = sv.objects.pin();
                 if let Some(object) = sv.spawn(key.clone(), ActorStartInfo::on_restart(), backoff) {
-                    sv.objects.insert(key.clone(), object)
+                    pinned
+                        .insert(key.clone(), object)
+                        .expect("where is the current actor?");
                 } else {
-                    sv.objects.remove(&key).map(|(_, v)| v)
+                    pinned.remove(&key).expect("where is the current actor?");
                 }
             } else {
                 debug!("actor won't be restarted");
-                sv.objects.remove(&key).map(|(_, v)| v)
+                sv.objects
+                    .pin()
+                    .remove(&key)
+                    .expect("where is the current actor?");
             }
-            .expect("where is the current actor?");
 
             // TODO: should we unregister the address right after failure?
             sv.context.book().remove(addr);
@@ -436,13 +459,14 @@ where
 
     fn spawn_on_group_mounted(self: &Arc<Self>, outcome: Outcome<R::Key>) {
         let start_info = ActorStartInfo::on_group_mounted();
+        let guard = self.objects.guard();
         match outcome {
             Outcome::Unicast(key) => {
-                get_or_spawn!(self, key, start_info);
+                self.get_or_spawn(key, start_info, &guard);
             }
             Outcome::Multicast(keys) => {
                 for key in keys {
-                    get_or_spawn!(self, key, start_info.clone());
+                    self.get_or_spawn(key, start_info.clone(), &guard);
                 }
             }
             Outcome::GentleUnicast(_)
@@ -467,11 +491,8 @@ where
             .update(control.user_config.as_ref().expect("just saved"));
 
         if need_to_update_actors {
-            for object in self.objects.iter() {
-                let actor = object
-                    .value()
-                    .as_actor()
-                    .expect("a supervisor stores only actors");
+            for (_, object) in self.objects.pin().iter() {
+                let actor = object.as_actor().expect("a supervisor stores only actors");
 
                 actor.set_mailbox_capacity_config(system.mailbox.capacity);
             }
@@ -494,11 +515,8 @@ where
         }
 
         // Send active statuses to the subscriber.
-        for item in self.objects.iter() {
-            let actor = item
-                .value()
-                .as_actor()
-                .expect("a supervisor stores only actors");
+        for (_, object) in self.objects.pin().iter() {
+            let actor = object.as_actor().expect("a supervisor stores only actors");
 
             let result = actor.with_status(|report| self.context.try_send_to(addr, report));
 
@@ -515,8 +533,9 @@ where
         let sv = self.clone();
         let addrs = self
             .objects
+            .pin()
             .iter()
-            .map(|r| r.value().addr())
+            .map(|(_, object)| object.addr())
             .collect::<Vec<_>>();
 
         let fut = async move {
