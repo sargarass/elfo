@@ -8,7 +8,6 @@ use derive_more::Display;
 
 use elfo::{
     Addr, Local,
-    config::AnyConfig,
     messages::UpdateConfig,
     prelude::*,
     routers::{MapRouter, Outcome},
@@ -17,6 +16,11 @@ use elfo::{
 
 #[path = "common.rs"]
 mod common;
+
+#[path = "telemetry_config.rs"]
+mod telemetry_config;
+
+use telemetry_config::Telemetry;
 
 // === Messages ===
 
@@ -192,9 +196,16 @@ async fn run<const FLAGS: Flags>(
 
     producers.mount(make_producers::<FLAGS>(producer_count, iter_count));
     consumers.mount(make_consumers::<FLAGS>(consumer_count));
+    let telemetry = Telemetry::from_env(Telemetry::Off).config();
     configurers.mount(elfo::batteries::configurer::fixture(
         &topology,
-        AnyConfig::default(),
+        toml::toml! {
+            [producers]
+            system.telemetry = (telemetry.clone())
+
+            [consumers]
+            system.telemetry = telemetry
+        },
     ));
 
     elfo::_priv::do_start(topology, false, |ctx, _| async move {
@@ -321,4 +332,13 @@ fn send_direct(c: &mut Criterion) {
     case::<{ SEND_DIRECT | ALL_TO_ONE }>(c);
 }
 
-criterion_group!(cases, send_routed, send_direct);
+criterion_group!(messaging_cases, send_routed, send_direct);
+
+pub(crate) fn cases() {
+    let telemetry = Telemetry::from_env(Telemetry::Off);
+    let _telemeter = match telemetry {
+        Telemetry::Off => None,
+        _ => Some(elfo::batteries::telemeter::init()),
+    };
+    messaging_cases();
+}

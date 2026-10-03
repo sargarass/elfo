@@ -19,9 +19,12 @@ tokio = { workspace = true, features = ["rt-multi-thread"] }
 derive_more.workspace = true
 criterion.workspace = true
 futures.workspace = true
+toml.workspace = true
 mimalloc = { version = "0.1.39", default-features = false }
 jemallocator = "0.5.4"
-tcmalloc = { version = "0.3.0", features = ["bundled"] }
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+tcmalloc-better = "0.1.19"
 
 [[bench]]
 name = "messaging_sys"
@@ -62,3 +65,5 @@ harness = false
 name = "yield"
 path = "yield.rs"
 harness = false
+[dependencies]
+cfg-if = "1.0.5"
