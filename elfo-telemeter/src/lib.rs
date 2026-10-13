@@ -26,6 +26,7 @@ pub mod config;
 pub mod protocol;
 
 mod actor;
+mod double_buffer;
 mod hyper;
 mod metrics;
 mod recorder;

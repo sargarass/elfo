@@ -7,7 +7,7 @@ pub(crate) fn register() {
     register_gauge!(
         "elfo_metrics_usage_bytes",
         Unit::Bytes,
-        "Total size occupied by metrics"
+        "Estimated memory used by metrics. Storage measures collected buffers before compaction."
     );
     register_gauge!(
         "elfo_metrics_storage_shards",

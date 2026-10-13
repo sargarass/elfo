@@ -1,6 +1,14 @@
 #![allow(private_interfaces)]
 
-use std::{hash::Hash, mem, sync::Arc};
+use std::{
+    hash::Hash,
+    mem,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use fxhash::FxHashMap;
 use metrics::{Key, Unit};
@@ -8,8 +16,10 @@ use parking_lot::{Mutex, MutexGuard};
 use thread_local::ThreadLocal;
 
 use elfo_core::{ActorMeta, Addr, coop, scope::Scope};
+use elfo_utils::CachePadded;
 
 use crate::{
+    double_buffer::{self, DoubleBuffer},
     metrics::{Counter, Gauge, GaugeOrigin, Histogram, MetricKind},
     protocol::{Description, Metrics, Snapshot},
     stats::{ShardStats, StorageStats},
@@ -27,7 +37,7 @@ pub(crate) trait ScopeKind: Sized {
 
     fn get_meta(scope: &Self::Scope) -> &Self::Meta;
     fn make_key(scope: &Self::Scope, key: &Key) -> Self::Key;
-    fn registries(shard: &Shard) -> &Registries<Self>;
+    fn registries(shard: &mut ShardData) -> &mut Registries<Self>;
     fn gauge_shared(storage: &Storage) -> &Mutex<GaugeOrigins<Self>>;
     fn snapshot<'s>(snapshot: &'s mut Snapshot, meta: &Self::Meta) -> &'s mut Metrics;
 }
@@ -47,8 +57,8 @@ impl ScopeKind for GlobalScope {
         key.get_hash()
     }
 
-    fn registries(shard: &Shard) -> &Registries<Self> {
-        &shard.global
+    fn registries(shard: &mut ShardData) -> &mut Registries<Self> {
+        &mut shard.global
     }
 
     fn gauge_shared(storage: &Storage) -> &Mutex<GaugeOrigins<Self>> {
@@ -77,8 +87,8 @@ impl ScopeKind for GroupScope {
         (scope.group(), key.get_hash())
     }
 
-    fn registries(shard: &Shard) -> &Registries<Self> {
-        &shard.groupwise
+    fn registries(shard: &mut ShardData) -> &mut Registries<Self> {
+        &mut shard.groupwise
     }
 
     fn gauge_shared(storage: &Storage) -> &Mutex<GaugeOrigins<Self>> {
@@ -113,8 +123,8 @@ impl ScopeKind for ActorScope {
         (scope.group(), key_hash)
     }
 
-    fn registries(shard: &Shard) -> &Registries<Self> {
-        &shard.actorwise
+    fn registries(shard: &mut ShardData) -> &mut Registries<Self> {
+        &mut shard.actorwise
     }
 
     fn gauge_shared(storage: &Storage) -> &Mutex<GaugeOrigins<Self>> {
@@ -139,22 +149,62 @@ pub(crate) struct Storage {
     // Shared gauge origins between shards. See `Gauge` for more details.
     gauge_shared: GaugeShared,
     descriptions: Mutex<FxHashMap<String, Description>>,
+    // Allows only one collector at a time.
+    merging: AtomicBool,
+}
+
+// Wait for busy shards: spin first, then yield, then sleep between passes.
+const SPIN_PASSES: u32 = 256;
+const YIELD_PASSES: u32 = 16;
+const SLEEP_PASS: Duration = Duration::from_millis(1);
+
+// The owner writes to one buffer while the telemeter collects the other.
+// See `double_buffer` for the synchronization protocol.
+#[derive(Default)]
+struct Shard {
+    data: DoubleBuffer<ShardData>,
+    // `ThreadLocal` stores shards next to each other. Padding prevents false
+    // sharing between the fields that neighboring owners access on each write.
+    _align: CachePadded<()>,
 }
 
 #[derive(Default)]
-struct Shard {
+struct ShardData {
     global: Registries<GlobalScope>,
     groupwise: Registries<GroupScope>,
     actorwise: Registries<ActorScope>,
 }
 
-// Most of the time, the mutexes are uncontended, because they are accessed only
-// by one thread. Periodically, they are accessed by the telemeter actor for the
-// short period of time in order to replace these registries with empty ones.
 struct Registries<S: ScopeKind> {
-    counters: Mutex<Registry<S, Counter>>,
-    gauges: Mutex<Registry<S, Gauge>>,
-    histograms: Mutex<Registry<S, Histogram>>,
+    counters: Registry<S, Counter>,
+    gauges: Registry<S, Gauge>,
+    histograms: Registry<S, Histogram>,
+}
+
+impl ShardData {
+    /// Creates empty registries with capacity for the current keys.
+    /// This reduces tail latency by avoiding allocation on the write path.
+    fn empty_like(&self) -> Self {
+        Self {
+            global: self.global.empty_like(),
+            groupwise: self.groupwise.empty_like(),
+            actorwise: self.actorwise.empty_like(),
+        }
+    }
+}
+
+impl<S: ScopeKind> Registries<S> {
+    fn empty_like(&self) -> Self {
+        fn empty<K, V>(registry: &FxHashMap<K, V>) -> FxHashMap<K, V> {
+            FxHashMap::with_capacity_and_hasher(registry.len(), <_>::default())
+        }
+
+        Self {
+            counters: empty(&self.counters),
+            gauges: empty(&self.gauges),
+            histograms: empty(&self.histograms),
+        }
+    }
 }
 
 impl<S: ScopeKind> Default for Registries<S> {
@@ -197,10 +247,15 @@ type GaugeOrigins<S> = FxHashMap<<S as ScopeKind>::Key, Arc<GaugeOrigin>>;
 
 impl Default for Storage {
     fn default() -> Self {
+        // Select the barrier mode before the first write.
+        let mode = double_buffer::mode();
+        tracing::info!(?mode, "telemetry storage barrier");
+
         Self {
             shards: ThreadLocal::new(),
             gauge_shared: Default::default(),
             descriptions: Default::default(),
+            merging: AtomicBool::new(false),
         }
     }
 }
@@ -224,37 +279,92 @@ impl Storage {
         S: ScopeKind,
         M: Storable,
     {
-        let shard = self.shards.get_or_default();
-        let registries = S::registries(shard);
+        let shard = self.shard();
         let reg_key = S::make_key(scope, key);
-        let mut registry = M::registry(registries).lock();
 
-        let entry = registry.entry(reg_key).or_insert_with(|| {
-            let shared = M::shared::<S>(self, reg_key);
-            RegEntry::<S, M>::new(scope, key, shared)
-        });
+        let write = |data: &mut ShardData| {
+            let registry = M::registry(S::registries(data));
+            let entry = registry.entry(reg_key).or_insert_with(|| {
+                let shared = M::shared::<S>(self, reg_key);
+                RegEntry::<S, M>::new(scope, key, shared)
+            });
+            entry.data.update(value);
+        };
 
-        entry.data.update(value);
+        // SAFETY: this thread owns the shard, and `write` does not call `upsert`.
+        unsafe { shard.data.write(write) };
     }
 
+    #[inline]
+    fn shard(&self) -> &Shard {
+        match self.shards.get() {
+            Some(shard) => shard,
+            None => self.shard_slow(),
+        }
+    }
+
+    // Keep shard allocation out of line to avoid stack realignment in callers.
+    #[cold]
+    #[inline(never)]
+    fn shard_slow(&self) -> &Shard {
+        self.shards.get_or_default()
+    }
+
+    /// Switches all shards to their other buffers and merges the previous buffers.
+    ///
+    /// Each call merges all metric kinds into `snapshot`, including counters and
+    /// gauges. Otherwise, the next scrape misses values in the previous buffers.
+    /// `only_compact` skips only storage statistics.
     pub(crate) async fn merge(&self, snapshot: &mut Snapshot, only_compact: bool) {
+        // Reject concurrent collection.
+        if self.merging.swap(true, Ordering::Acquire) {
+            tracing::error!("concurrent merge of the telemetry storage is skipped");
+            return;
+        }
+        let _merging = MergingGuard(&self.merging);
+
         let mut storage_stats = StorageStats::new::<Self>();
 
         if !only_compact {
             storage_stats.add_descriptions(&*self.descriptions.lock());
         }
 
-        for shard in self.shards.iter() {
-            let mut stats = ShardStats::new::<Shard>();
+        let shards: Vec<&Shard> = self.shards.iter().collect();
+        shards.iter().for_each(|shard| shard.data.advance());
+        if !double_buffer::barrier() {
+            // Owners can still write to either buffer. Leave the data for later merges.
+            tracing::error!("membarrier failed, metrics are left for the next cycle");
+            return;
+        }
 
-            self.merge_registries::<GlobalScope>(shard, snapshot, only_compact, &mut stats)
-                .await;
-            self.merge_registries::<GroupScope>(shard, snapshot, only_compact, &mut stats)
-                .await;
-            self.merge_registries::<ActorScope>(shard, snapshot, only_compact, &mut stats)
-                .await;
+        // Defer busy shards so a preempted owner does not delay other shards.
+        // Each shard waits for at most one write to its previous buffer.
+        let mut pending = shards;
+        let mut idle_passes = 0u32;
+        loop {
+            let mut i = 0;
+            while i < pending.len() {
+                if pending[i].data.can_collect() {
+                    let shard = pending.swap_remove(i);
+                    self.merge_shard(shard, snapshot, &mut storage_stats).await;
+                } else {
+                    i += 1;
+                }
+            }
 
-            storage_stats.add_shard(&stats);
+            if pending.is_empty() {
+                break;
+            }
+
+            // Limit the spin count because an owner can be preempted.
+            idle_passes += 1;
+            if idle_passes <= SPIN_PASSES {
+                std::hint::spin_loop();
+            } else if idle_passes <= SPIN_PASSES + YIELD_PASSES {
+                tokio::task::yield_now().await;
+            } else {
+                tokio::time::sleep(SLEEP_PASS).await;
+            }
         }
 
         if !only_compact {
@@ -262,46 +372,54 @@ impl Storage {
         }
     }
 
+    async fn merge_shard(&self, shard: &Shard, snapshot: &mut Snapshot, stats: &mut StorageStats) {
+        // Replace the previous buffer with empty registries before the async merge.
+        // SAFETY: `merge` advanced the epoch, and both `barrier` and `can_collect`
+        // returned true. `merging` excludes other collectors until the merge ends.
+        let mut data = unsafe {
+            shard.data.collect(|previous| {
+                let empty = previous.empty_like();
+                mem::replace(previous, empty)
+            })
+        };
+
+        let mut shard_stats = ShardStats::new::<Shard>();
+        self.merge_registries::<GlobalScope>(&mut data, snapshot, &mut shard_stats)
+            .await;
+        self.merge_registries::<GroupScope>(&mut data, snapshot, &mut shard_stats)
+            .await;
+        self.merge_registries::<ActorScope>(&mut data, snapshot, &mut shard_stats)
+            .await;
+        stats.add_shard(&shard_stats);
+    }
+
     async fn merge_registries<S: ScopeKind>(
         &self,
-        shard: &Shard,
+        shard: &mut ShardData,
         snapshot: &mut Snapshot,
-        only_compact: bool,
         stats: &mut ShardStats,
     ) {
         let registries = S::registries(shard);
 
-        if !only_compact {
-            self.merge_registry::<S, Counter>(registries, snapshot, stats)
-                .await;
-            self.merge_registry::<S, Gauge>(registries, snapshot, stats)
-                .await;
-        }
+        self.merge_registry::<S, Counter>(registries, snapshot, stats)
+            .await;
+        self.merge_registry::<S, Gauge>(registries, snapshot, stats)
+            .await;
         self.merge_registry::<S, Histogram>(registries, snapshot, stats)
             .await;
     }
 
     async fn merge_registry<S: ScopeKind, M: Storable>(
         &self,
-        registries: &Registries<S>,
+        registries: &mut Registries<S>,
         snapshot: &mut Snapshot,
         stats: &mut ShardStats,
     ) {
-        let registry = M::registry(registries);
-
-        let registry = {
-            // Allocate a new empty registry with enough capacity.
-            // It improves tail latency, what's important for near RT actors.
-            let len = registry.lock().len();
-            let empty = Registry::with_capacity_and_hasher(len, <_>::default());
-
-            let mut registry = registry.lock();
-            mem::replace(&mut *registry, empty)
-        };
+        let registry = mem::take(M::registry(registries));
 
         stats.add_registry(&registry);
 
-        for (_, entry) in registry.into_iter() {
+        for (_, entry) in registry {
             let metrics = S::snapshot(snapshot, &entry.meta);
             let out = M::snapshot(metrics, &entry.key);
             let additional_size = entry.data.merge(out);
@@ -313,17 +431,25 @@ impl Storage {
     }
 }
 
+struct MergingGuard<'a>(&'a AtomicBool);
+
+impl Drop for MergingGuard<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
 // === Storable ===
 
 pub(crate) trait Storable: MetricKind {
-    fn registry<S: ScopeKind>(registries: &Registries<S>) -> &Mutex<Registry<S, Self>>;
+    fn registry<S: ScopeKind>(registries: &mut Registries<S>) -> &mut Registry<S, Self>;
     fn shared<S: ScopeKind>(storage: &Storage, key: S::Key) -> Self::Shared;
     fn snapshot<'s>(metrics: &'s mut Metrics, key: &Key) -> &'s mut Self::Output;
 }
 
 impl Storable for Counter {
-    fn registry<S: ScopeKind>(registries: &Registries<S>) -> &Mutex<Registry<S, Self>> {
-        &registries.counters
+    fn registry<S: ScopeKind>(registries: &mut Registries<S>) -> &mut Registry<S, Self> {
+        &mut registries.counters
     }
 
     fn shared<S: ScopeKind>(_: &Storage, _: S::Key) -> Self::Shared {}
@@ -335,8 +461,8 @@ impl Storable for Counter {
 }
 
 impl Storable for Gauge {
-    fn registry<S: ScopeKind>(registries: &Registries<S>) -> &Mutex<Registry<S, Self>> {
-        &registries.gauges
+    fn registry<S: ScopeKind>(registries: &mut Registries<S>) -> &mut Registry<S, Self> {
+        &mut registries.gauges
     }
 
     fn shared<S: ScopeKind>(storage: &Storage, key: S::Key) -> Self::Shared {
@@ -351,8 +477,8 @@ impl Storable for Gauge {
 }
 
 impl Storable for Histogram {
-    fn registry<S: ScopeKind>(registries: &Registries<S>) -> &Mutex<Registry<S, Self>> {
-        &registries.histograms
+    fn registry<S: ScopeKind>(registries: &mut Registries<S>) -> &mut Registry<S, Self> {
+        &mut registries.histograms
     }
 
     fn shared<S: ScopeKind>(_: &Storage, _: S::Key) -> Self::Shared {}
@@ -360,5 +486,100 @@ impl Storable for Histogram {
     fn snapshot<'s>(metrics: &'s mut Metrics, key: &Key) -> &'s mut Self::Output {
         // TODO: hashbrown `entry_ref` (extra crate) or `contains_key` (double lookup).
         metrics.histograms.entry(key.clone()).or_default()
+    }
+}
+
+#[cfg(all(test, not(telemeter_loom)))]
+mod tests {
+    use std::{
+        sync::{
+            Barrier,
+            atomic::{AtomicBool, Ordering},
+        },
+        thread,
+    };
+
+    use metrics::GaugeValue;
+
+    use super::*;
+
+    // Concurrent writes and merges must preserve every update exactly once.
+    // Use release mode on Linux for `membarrier`, or set
+    // `ELFO_TELEMETRY_BARRIER=fence` for the fence fallback.
+    #[test]
+    fn concurrent_writes_and_merges_lose_nothing() {
+        let threads: usize =
+            std::env::var("TEST_THREADS_WRITERS").map_or(4, |v| v.parse().unwrap());
+        let merges: u64 = if cfg!(miri) { 3 } else { 2_000 };
+        // Limit raw histogram samples: on a shared core, writes can outpace merges.
+        let hist_every: u64 = std::env::var("TEST_HIST_EVERY").map_or(64, |v| v.parse().unwrap());
+
+        let storage = Arc::new(Storage::default());
+        let counter = Key::from_name("test_counter");
+        let histogram = Key::from_name("test_histogram");
+        let gauge = Key::from_name("test_gauge");
+        let start = Arc::new(Barrier::new(threads + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let owners: Vec<_> = (0..threads)
+            .map(|_| {
+                let (storage, start, stop) = (storage.clone(), start.clone(), stop.clone());
+                let (counter, histogram, gauge) =
+                    (counter.clone(), histogram.clone(), gauge.clone());
+                thread::spawn(move || {
+                    start.wait();
+                    let (mut counted, mut sampled) = (0u64, 0usize);
+                    while !stop.load(Ordering::Relaxed) {
+                        storage.upsert::<GlobalScope, Counter>(&(), &counter, 1);
+                        storage.upsert::<GlobalScope, Gauge>(
+                            &(),
+                            &gauge,
+                            GaugeValue::Increment(1.0),
+                        );
+                        counted += 1;
+                        if counted % hist_every == 0 {
+                            storage.upsert::<GlobalScope, Histogram>(&(), &histogram, 1.0);
+                            sampled += 1;
+                        }
+                    }
+                    (counted, sampled)
+                })
+            })
+            .collect();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let mut snapshot = Snapshot::default();
+        start.wait();
+        let began = std::time::Instant::now();
+        for i in 0..merges {
+            rt.block_on(storage.merge(&mut snapshot, i % 2 == 1));
+            if std::env::var_os("TEST_PROGRESS").is_some() && i % 100 == 0 {
+                eprintln!("merge {i} at {:?}", began.elapsed());
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        let (counted, sampled) = owners
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .fold((0, 0), |(c, s), (c1, s1)| (c + c1, s + s1));
+        rt.block_on(storage.merge(&mut snapshot, false));
+
+        assert_eq!(snapshot.global.counters[&counter], counted);
+        assert_eq!(snapshot.global.gauges[&gauge].0, counted as f64);
+        assert_eq!(
+            snapshot
+                .global
+                .histograms
+                .get(&histogram)
+                .map_or(0, |h| h.cumulative_count()),
+            sampled
+        );
+        eprintln!(
+            "mode {:?}: {merges} merges, {counted} counts",
+            double_buffer::mode()
+        );
     }
 }

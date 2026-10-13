@@ -23,12 +23,14 @@ unstable = []
 
 [dependencies]
 elfo-core = { version = "0.2.0-alpha.21", path = "../elfo-core", features = ["unstable"] }
+elfo-utils = { version = "0.2.7", path = "../elfo-utils" }
 
 instability.workspace = true
 metrics.workspace = true
-tokio = { workspace = true, features = ["net"] }
+tokio = { workspace = true, features = ["net", "time"] }
 thread_local.workspace = true
 parking_lot.workspace = true
+libc.workspace = true
 serde.workspace = true
 tracing.workspace = true
 hyper = { version = "1.1", features = ["server", "http1"] }
@@ -50,6 +52,7 @@ toml.workspace = true
 criterion.workspace = true
 proptest.workspace = true
 eyre.workspace = true
+loom = "0.7"
 reqwest = { version = "0.13", default-features = false, features = ["gzip"] }
 
 [package.metadata.docs.rs]

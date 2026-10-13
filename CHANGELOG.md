@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 <!-- next-header -->
 
 ## [Unreleased] - ReleaseDate
+
+### Changed
+
+- telemeter: write metrics without locked instructions and without locks: each shard keeps two buffers, the telemeter switches the owner to the other one with `membarrier(MEMBARRIER_CMD_PRIVATE_EXPEDITED)` on Linux (or `fence(SeqCst)` on both sides elsewhere or with `ELFO_TELEMETRY_BARRIER=fence`) and merges the previous one; counters and gauges are merged on every compaction tick.
+
 ### Fixed
 - core/config: hide `AnyConfig` contents in message dumps ([#190]).
 - core/config: hide secret values in `Secret<T>` deserialization errors ([#190]).
